@@ -1,0 +1,208 @@
+---
+title: "Spatial Modeling of C. sojina Resistance using Bernoulli Distribution"
+output: html_notebook
+---
+
+```{r}
+library(splines); library(rstan)
+library(ggplot2); library(scales); library(ggstance)
+library(ggspatial); library(sf); library(lwgeom); library(ggrepel)
+library(rnaturalearth); library(rnaturalearthdata); library(googleway)
+library(rgeos)
+library(maps)
+```
+
+
+Load the data
+```{r}
+resist <- read.csv("/Users/tschappe/Downloads/2018\ C.\ sojina\ Stats\ Map\ Sheet.csv")
+#Break the Lat and Lon columns and make them numeric
+resist$lat <- as.numeric(gsub("\\, [0-9\\-]+\\.[0-9]+", "", resist$Coordinates))
+resist$lon <- as.numeric(gsub("^[0-9\\-\\.]+\\, ", "", resist$Coordinates))
+```
+
+Add some noise at the county level so that the coords are not all identical
+```{r}
+resist$lat <- resist$lat + rnorm(nrow(resist), mean=0, sd=0.001)
+resist$lon <- resist$lon + rnorm(nrow(resist), mean=0, sd=0.001)
+```
+
+Make multivariate tensor product B-splines for observed and predicted values
+```{r}
+#Make simulated new values
+pred.latlon <- data.frame(
+  lat=seq.default(from=34.5, to=36.4, length.out = 20),
+  lon=seq.default(from=-79.6, to=-76, length.out = 20)
+)
+pred.grid <- expand.grid(lat=pred.latlon$lat, lon=pred.latlon$lon)
+pred.grid$samples <- rep(5, nrow(pred.grid))
+
+#Make b-splines
+k <- 8
+#Make b-splines for observed data
+b.lat <- bs(c(resist$lat, pred.grid$lat), df=k, intercept=T)
+b.lon <- bs(c(resist$lon, pred.grid$lon), df=k, intercept=T)
+# #Make b-splines for data we want to predict
+# b.lat.n <- bs(resist.nb.pred$lat, df=k, intercept=T)
+# b.lon.n <- bs(resist.nb.pred$lon, df=k, intercept=T)
+# #Combine them
+# b.lat.c <- rbind(b.lat, b.lat.n)
+# b.lon.c <- rbind(b.lon, b.lon.n)
+
+#Multiply them to make the multivariate splines
+X <- NULL
+for (i in 1:ncol(b.lat)) {
+  for (j in 1:ncol(b.lon)) {
+    X <- cbind(X, b.lat[,i]*b.lon[,j])
+  }
+}
+
+#Remove ones that are too close to 0
+X    <- as.matrix(X[,apply(X,2,max)>0.1])  # Remove basis function that are near zero for all sites
+X    <- ifelse(X>0.0001,X,0)
+# X <- cbind(rep(1,nrow(X)), X)
+
+#Now split them up by observed and predicted
+Xn <- X[(length(resist$lat)+1):(nrow(X)),]
+X <- X[1:length(resist$lat),]
+
+#Remove columns where either one has all zeros
+Xn2 <- Xn[,apply(Xn,2,max)>0.0001 & apply(X,2,max)>0.0001]
+X2 <- X[,apply(Xn,2,max)>0.0001 & apply(X,2,max)>0.0001]
+
+#Remove rows where either one has all zeros
+Xn2 <- Xn[apply(Xn,1,max)>0.0001, ]
+X2 <- X[(apply(X,1,max)>0.0001), ]
+```
+
+
+## Simple bernoulli model
+
+
+```{r}
+stan.bern1.stancode <- '
+data {
+  int<lower=1> N;                 //Number of observations
+  int<lower=1> Nn;
+  int<lower=1> K;                 //Number of predictors in X
+  int<lower=1> Kn;
+  //int<lower=1> acres[N];              //Acres of soybean
+  matrix[N,K] X;                  //Fixed effects model matrix
+  matrix[Nn,Kn] Xn;
+  int y[N];                      //Response variable
+}
+
+parameters {
+  //real<lower=0,upper=100> r; //Size parameter for NB
+  //real<lower=0.001,upper=1> theta; //Underestimation proportion parameter
+  //vector<lower=0.001,upper=1>[N] lambda; //True resistance rate
+  //real<lower=0> lr; //Sample size parameter for beta regression of lambda
+  real<lower=0> tau_b; //Hypervariance parameter for betas
+  vector[K] beta_raw; //X regression params
+}
+
+transformed parameters {
+  vector[N] q; //Mean of beta distribution
+  vector[K] beta;
+
+  beta = beta_raw * tau_b;
+  q = (X*beta); //lambda is exp of X*B
+  
+}
+
+model {
+  beta_raw ~ double_exponential(0, tau_b);
+  tau_b ~ cauchy(0, 2);
+
+
+//Likelihood
+  for (j in 1:N) {
+    y[j] ~ bernoulli_logit(q[j]); 
+  }
+  
+}
+
+generated quantities {
+  vector[N] y_rep;
+  vector[N] log_lik;
+  vector[Nn] pn;
+  vector[Nn] y_pred;
+  
+
+  for (n in 1:N) {
+    y_rep[n] = bernoulli_logit_rng(q[n]);
+    log_lik[n] = bernoulli_logit_lpmf(y[n] | q[n]);
+  }
+  
+  for (m in 1:Nn) {
+    pn[m] = (Xn[m,]*beta);
+    y_pred[m] = bernoulli_logit_rng(pn[m]);
+  }
+}
+
+'
+```
+
+Define the data for STAN
+```{r}
+stan.bern1.standata <- list(
+  y=resist$MUT, 
+  N=nrow(X2),
+  Nn=nrow(Xn2),
+  X=X2,
+  Xn=Xn2,
+  K=ncol(X2),
+  Kn=ncol(Xn2)
+)
+```
+
+Run the model
+```{r}
+stan.bern1.stanfit <- stan(
+  model_code = stan.bern1.stancode,
+  data=stan.bern1.standata, 
+  control = list(max_treedepth = 15, adapt_delta=0.9),
+  # init = init_ll,
+  chains=3,
+  warmup=1000,
+  iter=2000,
+  cores=3
+)
+```
+
+```{r}
+traceplot(stan.bern1.stanfit, pars = c("beta[1]"))
+# plot(stan.bern1.stanfit, pars = "q")
+```
+
+Get y_rep from Stan directly for both observed and predictions
+```{r}
+#Get posterior means of observed values
+resist$bern.p <- binomial(link="logit")$linkinv(apply(as.data.frame(stan.bern1.stanfit, pars = "q"), 2, mean))
+
+#Get posterior means of predicted values
+pred.grid$bern.p.rep <- binomial(link="logit")$linkinv(apply(as.data.frame(stan.bern1.stanfit, pars = "pn"), 2, mean))
+```
+
+
+Make a heatmap
+```{r}
+theme_set(theme_bw())
+
+#Make base map
+world <- ne_countries(scale="medium", returnclass = "sf")
+states <- st_as_sf(map("state", plot = FALSE, fill = TRUE))
+states <- cbind(states, st_coordinates(st_centroid(states)))
+counties <- st_as_sf(map("county", plot = FALSE, fill = TRUE))
+
+(resistance.bern.prob.map <- ggplot(data = world) +
+  geom_sf() +
+  # geom_sf(data = counties2, aes(fill = log(counties2$est.true.inf)))+
+  geom_point(aes(x=lon, y=lat, color=bern.p), alpha=1, resist)+
+  geom_point(aes(x=lon, y=lat, color=bern.p.rep), alpha=1, size=0.8, pred.grid)+
+  scale_color_continuous(name="Probability\nof resistance")+
+  # scale_color_continuous(name="Predicted probability\nof resistance")+
+  coord_sf(xlim = c(-80.5, -75), ylim = c(34, 37), expand = FALSE)
+)
+# ggsave(resistance.bern.prob.map, width=8, height=8, file="/Users/tschappe/Downloads/resistance.bern.map.1.pdf")
+```
